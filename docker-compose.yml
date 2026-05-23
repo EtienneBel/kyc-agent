@@ -1,0 +1,57 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: kyc_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-kyc_agent}
+      POSTGRES_USER: ${DB_USER:-kyc_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-kyc_secret}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-kyc_user} -d ${DB_NAME:-kyc_agent}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kyc-agent:
+    build: .
+    container_name: kyc_agent
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      HUMAN_REVIEW_AGENT_URL: http://human-review:8001
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Human Review Agent — A2A endpoint
+  human-review:
+    build: .
+    container_name: kyc_human_review
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./:/app
+    command: uvicorn a2a.human_review_agent:app --host 0.0.0.0 --port 8001 --reload
+
+volumes:
+  postgres_data:
+  # ollama_data:

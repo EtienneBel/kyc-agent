@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+*.whl
+venv/
+.venv/
+env/
+
+# Environment
+.env
+*.env.local
+
+# Uploads (never commit user data)
+uploads/
+files/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log
+
+# DeepFace models (large files — download on first run)
+.deepface/
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
