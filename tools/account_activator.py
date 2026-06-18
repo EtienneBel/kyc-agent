@@ -7,12 +7,74 @@ Logs the decision to the audit trail.
 
 import json
 import logging
+from difflib import SequenceMatcher
 from uuid import UUID
 
+from config import settings
 from db import get_pool
 from .a2a_escalator import escalate_to_human_review
+from .scorer import compute_score
 
 logger = logging.getLogger(__name__)
+
+
+async def _compute_score_from_db(submission_id: str) -> dict:
+    """
+    Compute the KYC score deterministically from raw tool results stored in the DB.
+    Called by activate_account so the LLM-supplied score is never trusted.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT doc_confidence, face_confidence, face_match,
+                   first_name, last_name, phone
+            FROM kyc_submissions WHERE id = $1
+            """,
+            UUID(submission_id),
+        )
+
+        if not row:
+            logger.warning(f"[account_activator] submission {submission_id} not found — using zero score")
+            return compute_score(
+                {"confidence": 0.0},
+                {"match": False, "confidence": 0.0},
+                {"is_duplicate": False},
+                {"is_sanctioned": False},
+            )
+
+        doc_data = {"confidence": float(row["doc_confidence"] or 0.0)}
+        face_result = {
+            "match": bool(row["face_match"]),
+            "confidence": float(row["face_confidence"] or 0.0),
+        }
+
+        # Re-query duplicate: same phone, different submission, not rejected, within 24 h
+        dup_row = await conn.fetchrow(
+            """
+            SELECT id FROM kyc_submissions
+            WHERE phone = $1
+              AND id != $2
+              AND decision != 'rejected'
+              AND created_at > NOW() - INTERVAL '24 hours'
+            LIMIT 1
+            """,
+            row["phone"],
+            UUID(submission_id),
+        )
+        dup_result = {"is_duplicate": dup_row is not None}
+
+        # Re-query sanctions by fuzzy name match
+        is_sanctioned = False
+        if row["first_name"] and row["last_name"]:
+            full_name = f"{row['first_name']} {row['last_name']}".strip().lower()
+            sanctions = await conn.fetch("SELECT full_name FROM sanctions_list")
+            is_sanctioned = any(
+                SequenceMatcher(None, full_name, s["full_name"].strip().lower()).ratio() >= 0.85
+                for s in sanctions
+            )
+
+        return compute_score(doc_data, face_result, dup_result, {"is_sanctioned": is_sanctioned})
 
 
 async def activate_account(
@@ -40,6 +102,20 @@ async def activate_account(
     decision = _decision_map.get(decision, decision)
     if decision not in ("approved", "rejected", "pending_review"):
         decision = "pending_review"
+
+    # For agent decisions, ignore the LLM-supplied score and compute it
+    # deterministically from tool results stored in the DB.
+    # Human reviewers (reviewed_by not in the agent set) keep their passed score.
+    if reviewed_by in ("kyc-agent", "kyc-agent-fallback"):
+        computed = await _compute_score_from_db(submission_id)
+        score = computed["score"]
+        decision = computed["decision"]
+        logger.info(
+            f"[account_activator] Server-computed score={score} decision={decision} "
+            f"breakdown={computed['breakdown']} for {submission_id}"
+        )
+    else:
+        score = max(0, min(100, score))
 
     logger.info(f"[account_activator] submission={submission_id} decision={decision} score={score}")
 

@@ -8,7 +8,9 @@ Orchestrates the full KYC verification pipeline using:
   - Gemma (local) or Gemini (prod) as the reasoning model
 """
 
+import json
 import logging
+import re
 from typing import Any
 from uuid import UUID
 
@@ -21,6 +23,7 @@ import litellm
 from config import settings
 from db import get_pool
 from agent.prompts import KYC_AGENT_INSTRUCTION
+from tools.scorer import compute_score
 from tools import (
     extract_document_data,
     face_match,
@@ -28,7 +31,7 @@ from tools import (
     check_duplicate_account,
     activate_account,
     send_sms,
-    escalate_to_human_review,
+    escalate_to_human_review,  # registered as agent tool; also used indirectly via activate_account
 )
 
 logger = logging.getLogger(__name__)
@@ -133,10 +136,12 @@ Effectuez toutes les vérifications requises dans l'ordre et prenez une décisio
     logger.info(f"[kyc_agent] Completed | submission={submission_id}")
     logger.info(f"[kyc_agent] Summary:\n{final_response}")
 
-    # ── Guaranteed A2A escalation ─────────────────────────────
-    # gemma3:4b sometimes drops mid-sequence tool calls. If the submission
-    # still has decision=pending_review and no score, escalate now.
-    await _ensure_escalated_if_pending(submission_id, phone)
+    # ── Guaranteed finalisation ───────────────────────────────
+    # gemma3:4b sometimes drops mid-sequence tool calls (writes a JSON summary
+    # in text but never calls activate_account). Parse the text output to
+    # recover the intended decision/score before falling back.
+    parsed = _parse_decision_from_text(final_response)
+    await _ensure_finalised_if_pending(submission_id, phone, parsed)
 
     return {
         "submission_id": submission_id,
@@ -146,8 +151,25 @@ Effectuez toutes les vérifications requises dans l'ordre et prenez une décisio
     }
 
 
-async def _ensure_escalated_if_pending(submission_id: str, phone: str) -> None:
-    """Escalate to human review if the agent left the submission in pending_review without a score."""
+def _parse_decision_from_text(text: str) -> dict | None:
+    """Extract decision/score from Gemma's JSON text output when tool call was dropped."""
+    try:
+        match = re.search(r'\{[^{}]*"decision"[^{}]*\}', text, re.DOTALL)
+        if match:
+            data = json.loads(match.group())
+            args = data.get("args", data)
+            decision = args.get("decision")
+            score = args.get("score")
+            reason = args.get("reason", "")
+            if decision in ("approved", "rejected", "pending_review") and isinstance(score, int):
+                return {"decision": decision, "score": score, "reason": reason}
+    except Exception:
+        pass
+    return None
+
+
+async def _ensure_finalised_if_pending(submission_id: str, phone: str, parsed: dict | None) -> None:
+    """Write final decision to DB if Gemma dropped the tool call mid-sequence."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -158,12 +180,48 @@ async def _ensure_escalated_if_pending(submission_id: str, phone: str) -> None:
     if not row or row["decision"] != "pending_review" or row["score"] is not None:
         return
 
-    logger.info(f"[kyc_agent] Agent dropped mid-sequence — auto-escalating {submission_id}")
-    await escalate_to_human_review(
+    # Try parsed text decision first, then fall back to computed score from DB data
+    if parsed and parsed.get("decision") in ("approved", "rejected", "pending_review"):
+        decision = parsed["decision"]
+        score = parsed["score"]
+        reason = parsed.get("reason", "Agent output parsed — tool call dropped")
+        logger.info(
+            f"[kyc_agent] Applying parsed decision={decision} score={score} for {submission_id}"
+        )
+    else:
+        # Load tool results from DB and compute score deterministically
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            sub = await conn.fetchrow(
+                """
+                SELECT first_name, last_name, document_number, nationality
+                FROM kyc_submissions WHERE id = $1
+                """,
+                UUID(submission_id),
+            )
+
+        # Build minimal doc_data from what's in DB (written by extract_document_data in Task 2)
+        doc_data = {}
+        if sub and sub["first_name"]:
+            doc_data = {"confidence": 0.6}  # conservative: readable but uncertain
+
+        computed = compute_score(
+            doc_data=doc_data,
+            face_result={"match": False, "confidence": 0.0},  # unknown — conservative
+            dup_result={"is_duplicate": False},
+            sanctions_result={"is_sanctioned": False},
+        )
+        decision = computed["decision"]
+        score = computed["score"]
+        reason = f"Escalade automatique — agent interrompu. Score calculé: {score}/100"
+        logger.info(
+            f"[kyc_agent] Computed fallback score={score} decision={decision} for {submission_id}"
+        )
+
+    await activate_account(
         submission_id=submission_id,
-        phone=phone,
-        score=0,
-        reason="Escalade automatique — agent interrompu en cours de séquence",
-        document_data={},
-        face_match_result={},
+        score=score,
+        decision=decision,
+        reason=reason,
+        reviewed_by="kyc-agent-fallback",
     )

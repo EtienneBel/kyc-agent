@@ -5,6 +5,7 @@ from .duplicate_checker import check_duplicate_account
 from .account_activator import activate_account
 from .sms_sender import send_sms
 from .a2a_escalator import escalate_to_human_review
+from .scorer import compute_score
 
 __all__ = [
     "extract_document_data",
@@ -14,4 +15,5 @@ __all__ = [
     "activate_account",
     "send_sms",
     "escalate_to_human_review",
+    "compute_score",
 ]

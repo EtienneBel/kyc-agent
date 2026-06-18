@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 TEMPLATES = {
     "approved": (
         "Bonjour {first_name}, votre identité a été vérifiée avec succès. "
-        "Votre compte est maintenant actif. Bienvenue ! 🎉"
+        "Votre compte est maintenant actif. Bienvenue !"
     ),
     "rejected": (
         "Bonjour {first_name}, nous n'avons pas pu vérifier votre identité. "
@@ -68,7 +68,7 @@ async def _send_mock(phone: str, message: str) -> dict:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     print("\n" + "─" * 60)
-    print(f"  📱 SMS MOCK — {timestamp}")
+    print(f"  [SMS MOCK] — {timestamp}")
     print(f"  To      : {phone}")
     print(f"  From    : {settings.AFRICASTALKING_SENDER_ID}")
     print(f"  Message : {message}")

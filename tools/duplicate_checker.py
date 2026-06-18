@@ -47,11 +47,13 @@ async def check_duplicate_account(
                 "status": account["status"],
             }
 
-        # ── Check 2: Pending KYC with same phone ───────────────
+        # ── Check 2: Pending KYC with same phone (within 24h) ─
         pending = await conn.fetchrow(
             """
             SELECT id, decision FROM kyc_submissions
-            WHERE phone = $1 AND decision != 'rejected'
+            WHERE phone = $1
+              AND decision != 'rejected'
+              AND created_at > NOW() - INTERVAL '24 hours'
             ORDER BY created_at DESC LIMIT 1
             """,
             phone,

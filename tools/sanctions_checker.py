@@ -1,10 +1,10 @@
 """
 MCP Tool: sanctions_checker
 ────────────────────────────
-Cross-references a person against:
-  - Local sanctions table (PostgreSQL)
-  - OFAC SDN list (fetched via public API)
-  - BCEAO watchlist (pluggable)
+Cross-references a person against the local PostgreSQL sanctions table.
+
+Scope: LOCAL_DB only (seeded from db/migrations/001_init.sql).
+OFAC and BCEAO integrations are not implemented — add them here when needed.
 """
 
 import logging
@@ -57,12 +57,6 @@ async def check_sanctions_list(
     local_matches = await _check_local_db(full_name, date_of_birth, nationality)
     sources_checked.append("LOCAL_DB")
     matches.extend(local_matches)
-
-    # ── 2. OFAC SDN (open public API) ─────────────────────────
-    # Uncomment in prod — adds ~200ms latency
-    # ofac_matches = await _check_ofac(full_name, date_of_birth)
-    # sources_checked.append("OFAC")
-    # matches.extend(ofac_matches)
 
     is_sanctioned = len(matches) > 0
 
@@ -123,26 +117,3 @@ async def _check_local_db(
             })
 
     return matches
-
-
-async def _check_ofac(full_name: str, date_of_birth: str | None) -> list[dict]:
-    """
-    Query OFAC SDN public API.
-    Docs: https://sanctionslistservice.ofac.treas.gov/api/
-    """
-    import httpx
-
-    url = "https://sanctionslistservice.ofac.treas.gov/api/publicationsUpdates"
-    params = {"name": full_name}
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
-            # Parse OFAC response format
-            # Implementation depends on OFAC API version
-            return []
-        except Exception as e:
-            logger.error(f"[sanctions_checker] OFAC API error: {e}")
-            return []

@@ -10,6 +10,8 @@ prod env   → Gemini 1.5 Flash Vision
 import base64
 import json
 import logging
+import uuid
+from datetime import date
 from pathlib import Path
 
 from google import genai
@@ -18,6 +20,7 @@ import httpx
 from pydantic import BaseModel
 
 from config import settings
+from db import get_pool
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +79,17 @@ async def extract_document_data(image_path: str) -> dict:
         result = await _extract_with_ollama(image_b64)
 
     logger.info(f"[document_extractor] Result: {result}")
+
+    # Persist extracted fields immediately — don't wait for activate_account
+    submission_id = _parse_submission_id(image_path)
+    if submission_id:
+        try:
+            await _persist_to_db(submission_id, result)
+            logger.info(f"[document_extractor] Persisted to DB: submission={submission_id}")
+        except Exception as e:
+            logger.error(f"[document_extractor] DB write failed: {e}")
+            # Don't fail the tool — return result even if DB write fails
+
     return result
 
 
@@ -129,6 +143,64 @@ async def _extract_with_ollama(image_b64: str) -> dict:
         response.raise_for_status()
         data = response.json()
         return _parse_json_response(data.get("message", {}).get("content", "{}"))
+
+
+def _parse_submission_id(image_path: str) -> str | None:
+    """
+    Derive submission_id from image filename.
+    main.py creates files as: uploads/{UUID}_doc.{ext}
+    Returns the UUID string, or None if pattern doesn't match.
+    """
+    try:
+        stem = Path(image_path).stem  # e.g. "abc123-..._doc"
+        base = stem.rsplit("_", 1)[0]  # e.g. "abc123-..."
+        uuid.UUID(base)               # validates UUID format
+        return base
+    except (ValueError, AttributeError, IndexError):
+        return None
+
+
+async def _persist_to_db(submission_id: str, doc: dict) -> None:
+    """Write extracted document fields to kyc_submissions."""
+    pool = await get_pool()
+
+    def parse_date(val: str | None) -> date | None:
+        if not val:
+            return None
+        try:
+            return date.fromisoformat(val[:10])
+        except ValueError:
+            return None
+
+    doc_type = doc.get("document_type")
+    valid_types = {"cni", "passport", "residence_permit"}
+    if doc_type not in valid_types:
+        doc_type = None  # leave existing value
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE kyc_submissions SET
+                first_name      = COALESCE($2, first_name),
+                last_name       = COALESCE($3, last_name),
+                date_of_birth   = COALESCE($4, date_of_birth),
+                document_number = COALESCE($5, document_number),
+                document_expiry = COALESCE($6, document_expiry),
+                nationality     = COALESCE($7, nationality),
+                document_type   = COALESCE($8::document_type, document_type),
+                doc_confidence  = COALESCE($9, doc_confidence)
+            WHERE id = $1
+            """,
+            uuid.UUID(submission_id),
+            doc.get("first_name"),
+            doc.get("last_name"),
+            parse_date(doc.get("date_of_birth")),
+            doc.get("document_number"),
+            parse_date(doc.get("document_expiry")),
+            doc.get("nationality"),
+            doc_type,
+            doc.get("confidence"),
+        )
 
 
 def _parse_json_response(raw: str) -> dict:

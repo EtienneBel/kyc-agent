@@ -6,12 +6,34 @@ Called by the KYC agent when score is 70-94 (pending_review decision).
 """
 
 import logging
+import uuid
 
 import httpx
 
 from config import settings
+from db import get_pool
 
 logger = logging.getLogger(__name__)
+
+
+async def _load_document_data(submission_id: str) -> dict:
+    """Load extracted document fields from DB when caller didn't provide them."""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT first_name, last_name, date_of_birth, document_number,
+                       document_expiry, nationality, document_type
+                FROM kyc_submissions WHERE id = $1
+                """,
+                uuid.UUID(submission_id),
+            )
+        if row:
+            return {k: str(v) if v is not None else None for k, v in dict(row).items()}
+    except Exception as e:
+        logger.error(f"[a2a_escalator] Failed to load document data: {e}")
+    return {}
 
 
 async def escalate_to_human_review(
@@ -37,6 +59,9 @@ async def escalate_to_human_review(
     Returns:
         dict: { task_id, status, message } from the human review agent
     """
+    if not document_data:
+        document_data = await _load_document_data(submission_id)
+
     payload = {
         "submission_id": submission_id,
         "phone": phone,
